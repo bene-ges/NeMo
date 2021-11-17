@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import List
+from typing import List, Tuple
 
 from nemo.collections.common.tokenizers.moses_tokenizers import MosesProcessor
 from nemo.collections.nlp.data.text_normalization import constants
@@ -164,8 +164,12 @@ class TextNormalizationTestDataset:
         Return: an int value (0/1) indicating whether pred and target are the same.
         """
         if inst_dir == constants.INST_BACKWARD:
+            # to have a unified format for abbreviations, e.g. U.S. == U. S.
+            target = target.replace(" ", "")
+            pred = pred.replace(" ", "")
             pred = remove_puncts(pred)
             target = remove_puncts(target)
+
         pred = normalize_str(pred)
         target = normalize_str(target)
         return int(pred == target)
@@ -266,3 +270,129 @@ class TextNormalizationTestDataset:
             class2stats[key] = (class2correct[key] / class2stats[key], class2correct[key], class2stats[key])
 
         return class2stats
+
+    @staticmethod
+    def compute_class_accuracy_for_tagger_and_decoder(
+        inputs: List[List[str]],
+        targets: List[List[str]],
+        tag_preds: List[List[str]],
+        inst_directions: List[str],
+        output_spans: List[List[str]],
+        classes: List[List[str]],
+        nb_spans: List[int],
+        span_ends: List[List[int]],
+    ) -> Tuple[dict, dict, dict, dict]:
+        """
+        Compute the class based accuracy metric for predicted tags.
+
+        Args:
+            inputs: List of lists where inner list contains words of input text
+            targets: List of lists where inner list contains target strings grouped by class boundary
+            tag_preds: List of lists where inner list contains predicted tags for each of the input words
+            inst_directions: A list of str where each str indicates the direction of the corresponding instance (i.e., INST_BACKWARD or INST_FORWARD).
+            output_spans: A list of lists where each inner list contains the decoded spans for the corresponding input sentence
+            classes: A list of lists where inner list contains the class for each semiotic token in input sentence
+            nb_spans: A list that contains the number of tokens in the input
+            span_ends: A list of lists where inner list contains the end word index of the current token
+        Return:
+            the class error scores for tagger as dict[class][err_type]=tuple(error ratio, error count, total count)
+            sentences with errors for tagger as dict[class]=list(tuple(tag_pred, tag_ground, word, sent)
+            the class accuracy scores for decoder as dict
+            sentences with errors for decoder as dict[class]=list(tuple(pred, ground, input, sent)
+        """
+
+        tagger_errors = defaultdict(list)
+        sum_tags_per_class = defaultdict(int)
+        err_tags_per_class = defaultdict(dict)
+        for i in range(len(inputs)):
+            tag_ground_truth = []
+            classes_for_tag_preds = []
+            assert (len(classes) == len(span_ends))
+            begin = 0
+            for j in range(len(span_ends[i])):
+                c = classes[i][j]
+                end = span_ends[i][j]
+                classes_for_tag_preds += [c for k in range(end - begin)]
+                if c == "PLAIN" and end - begin == 1 and targets[i][j] == inputs[i][begin]:
+                    for k in range(begin, end):
+                        tag_ground_truth.append("B-SAME")
+                else:
+                    tag_ground_truth.append("B-TRANSFORM")
+                    for k in range(begin + 1, end):
+                        tag_ground_truth.append("I-TRANSFORM")
+                begin = end
+
+            assert (len(tag_ground_truth) == len(tag_preds[i])), "tag_ground_truth=" + str(tag_ground_truth) + "; tag_preds[i])=" + str(tag_preds[i])
+            assert (len(classes_for_tag_preds) == len(tag_preds[i])), "classes_for_tag_preds=" + str(classes_for_tag_preds)
+
+            for j in range(len(tag_preds[i])):
+                sum_tags_per_class[classes_for_tag_preds[j]] += 1
+                if tag_ground_truth[j] != tag_preds[i][j]:
+                    key = tag_preds[i][j] + " " + tag_ground_truth[j]
+                    err_tags_per_class[classes_for_tag_preds[j]].setdefault(key, 0)
+                    err_tags_per_class[classes_for_tag_preds[j]][key] += 1
+                    tagger_errors[classes_for_tag_preds[j]].append((tag_preds[i][j],
+                                          tag_ground_truth[j],
+                                          inputs[i][j],
+                                          inputs[i]))
+        for c in sum_tags_per_class:
+            for err_type in sorted(err_tags_per_class[c]):
+                err_tags_per_class[c][err_type] = (err_tags_per_class[c][err_type] / sum_tags_per_class[c], err_tags_per_class[c][err_type], sum_tags_per_class[c])
+
+        #pdb.set_trace()
+
+
+        decoder_errors = defaultdict(list)
+        class2stats, class2correct = defaultdict(int), defaultdict(int)
+        for ix, (sent, tags) in enumerate(zip(inputs, tag_preds)):
+            try:
+                assert len(sent) == len(tags)
+            except:
+                logging.warning(f"Error: skipping example {ix}")
+                continue
+            cur_words = [[] for _ in range(nb_spans[ix])]
+            cur_input_words = [[] for _ in range(nb_spans[ix])]
+            jx, span_idx = 0, 0
+            cur_spans = output_spans[ix]
+            class_idx = 0
+            if classes[ix]:
+                class2stats[classes[ix][class_idx]] += 1
+            while jx < len(sent):
+                tag, word = tags[jx], sent[jx]
+                while jx >= span_ends[ix][class_idx]:
+                    class_idx += 1
+                    class2stats[classes[ix][class_idx]] += 1
+                cur_input_words[class_idx].append(word)
+                if constants.SAME_TAG in tag:
+                    cur_words[class_idx].append(word)
+                    jx += 1
+                else:
+                    jx += 1
+                    tmp = cur_spans[span_idx]
+                    cur_words[class_idx].append(tmp)
+                    span_idx += 1
+                    while jx < len(sent) and tags[jx] == constants.I_PREFIX + constants.TRANSFORM_TAG:
+                        cur_input_words[class_idx].append(sent[jx])
+                        while jx >= span_ends[ix][class_idx]:
+                            class_idx += 1
+                            class2stats[classes[ix][class_idx]] += 1
+                            cur_words[class_idx].append(tmp)
+                        jx += 1
+
+            target_token_idx = 0
+            # assert len(cur_words) == len(targets[ix])
+            for class_idx in range(nb_spans[ix]):
+                #pdb.set_trace()
+                c = classes[ix][class_idx]
+                pred = " ".join(cur_words[class_idx])
+                target = targets[ix][target_token_idx]
+                correct = TextNormalizationTestDataset.is_same(pred, target, inst_directions[ix])
+                if not correct:
+                    decoder_errors[c].append((pred, target, " ".join(cur_input_words[class_idx]), " ".join(sent)))
+                class2correct[c] += correct
+                target_token_idx += 1
+
+        for key in class2stats:
+            class2stats[key] = (class2correct[key] / class2stats[key], class2correct[key], class2stats[key])
+
+        return err_tags_per_class, tagger_errors, class2stats, decoder_errors

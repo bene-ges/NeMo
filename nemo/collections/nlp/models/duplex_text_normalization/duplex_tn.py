@@ -217,6 +217,173 @@ class DuplexTextNormalizationModel(nn.Module):
         logging.info(f'Errors are saved at {errors_log_fp}.')
         return results
 
+    def evaluate_with_details(
+        self, dataset: TextNormalizationTestDataset, batch_size: int, errors_log_fp: str, verbose: bool = True
+    ):
+        """ Function for evaluating the performance of the model on a dataset
+
+        Args:
+            dataset: The dataset to be used for evaluation.
+            batch_size: Batch size to use during inference. You can set it to be 1
+                (no batching) if you want to measure the running time of the model
+                per individual example (assuming requests are coming to the model one-by-one).
+            errors_log_fp: Path to the file for logging the errors
+            verbose: if true prints and logs various evaluation results
+
+        Returns:
+            results: A Dict containing the evaluation results (e.g., accuracy, running time)
+        """
+        results = {}
+        error_f_tagger = open(errors_log_fp + ".tagger", 'w+')
+        error_f_decoder = open(errors_log_fp + ".decoder", 'w+')
+
+        # Apply the model on the dataset
+        (
+            all_run_times,
+            all_dirs,
+            all_inputs,
+            all_targets,
+            all_classes,
+            all_nb_spans,
+            all_span_starts,
+            all_span_ends,
+            all_output_spans,
+        ) = ([], [], [], [], [], [], [], [], [])
+        all_tag_preds, all_final_preds = [], []
+        nb_iters = int(ceil(len(dataset) / batch_size))
+        for i in tqdm(range(nb_iters)):
+            start_idx = i * batch_size
+            end_idx = (i + 1) * batch_size
+            batch_insts = dataset[start_idx:end_idx]
+            (
+                batch_dirs,
+                batch_inputs,
+                batch_targets,
+                batch_classes,
+                batch_nb_spans,
+                batch_span_starts,
+                batch_span_ends,
+            ) = zip(*batch_insts)
+            # Inference and Running Time Measurement
+            batch_start_time = perf_counter()
+
+            batch_tag_preds, batch_output_spans, batch_final_preds = self._infer(
+                batch_inputs, batch_dirs, processed=True
+            )
+
+            batch_run_time = (perf_counter() - batch_start_time) * 1000  # milliseconds
+            all_run_times.append(batch_run_time)
+            # Update all_dirs, all_inputs, all_tag_preds, all_final_preds and all_targets
+            all_dirs.extend(batch_dirs)
+            all_inputs.extend(batch_inputs)
+            all_tag_preds.extend(batch_tag_preds)
+            all_final_preds.extend(batch_final_preds)
+            all_targets.extend(batch_targets)
+            all_classes.extend(batch_classes)
+            all_nb_spans.extend(batch_nb_spans)
+            all_span_starts.extend(batch_span_starts)
+            all_span_ends.extend(batch_span_ends)
+            all_output_spans.extend(batch_output_spans)
+
+        # Metrics
+        tn_error_ctx, itn_error_ctx = 0, 0
+        for direction in constants.INST_DIRECTIONS:
+            (
+                cur_dirs,
+                cur_inputs,
+                cur_tag_preds,
+                cur_final_preds,
+                cur_targets,
+                cur_classes,
+                cur_nb_spans,
+                cur_span_starts,
+                cur_span_ends,
+                cur_output_spans,
+            ) = ([], [], [], [], [], [], [], [], [], [])
+            for dir, _input, tag_pred, final_pred, target, cls, nb_spans, span_starts, span_ends, output_spans in zip(
+                all_dirs,
+                all_inputs,
+                all_tag_preds,
+                all_final_preds,
+                all_targets,
+                all_classes,
+                all_nb_spans,
+                all_span_starts,
+                all_span_ends,
+                all_output_spans,
+            ):
+                if dir == direction:
+                    cur_dirs.append(dir)
+                    cur_inputs.append(_input)
+                    cur_tag_preds.append(tag_pred)
+                    cur_final_preds.append(final_pred)
+                    cur_targets.append(target)
+                    cur_classes.append(cls)
+                    cur_nb_spans.append(nb_spans)
+                    cur_span_starts.append(span_starts)
+                    cur_span_ends.append(span_ends)
+                    cur_output_spans.append(output_spans)
+            nb_instances = len(cur_final_preds)
+            cur_targets_sent = [" ".join(x) for x in cur_targets]
+
+            sent_accuracy = TextNormalizationTestDataset.compute_sent_accuracy(
+                cur_final_preds, cur_targets_sent, cur_dirs
+            )
+
+            tagger_error_scores, tagger_error_sentences, decoder_class_accuracy, decoder_error_sentences = TextNormalizationTestDataset.compute_class_accuracy_for_tagger_and_decoder(
+                [x.split() for x in cur_inputs],
+                cur_targets,
+                cur_tag_preds,
+                cur_dirs,
+                cur_output_spans,
+                cur_classes,
+                cur_nb_spans,
+                cur_span_ends,
+            )
+            log_class_tagger_errors = "\n"
+            for c in tagger_error_scores:
+                log_class_tagger_errors += "\t" + c + "\n"
+                for err_type in sorted(tagger_error_scores[c]):
+                    err_ratio, err_count, total_count = tagger_error_scores[c][err_type]
+                    log_class_tagger_errors += "\t\t" + err_type + "\t" + str(round(err_ratio, 7)) + "\t" + str(err_count) + "/" + str(total_count) + "\n"
+            for c in tagger_error_scores:
+                log_class_tagger_errors += "\t" + c + "\n"
+                for err_type in sorted(tagger_error_scores[c]):
+                    err_ratio, err_count, total_count = tagger_error_scores[c][err_type]
+                    log_class_tagger_errors += "\t\t" + err_type + "\t" + str(round(err_ratio, 7)) + "\t" + str(err_count) + "/" + str(total_count) + "\n"
+            if verbose:
+                logging.info(f'\n============ Direction {direction} ============')
+                logging.info(f'Sentence Accuracy: {sent_accuracy}')
+                logging.info(f'nb_instances: {nb_instances}')
+                logging.info(f'tagger_error_scores: {log_class_tagger_errors}')
+                logging.info(f'decoder class accuracies: {decoder_class_accuracy}')
+            # Update results
+            results[direction] = {
+                'sent_accuracy': sent_accuracy,
+                'nb_instances': nb_instances,
+                "tagger_error_scores": tagger_error_scores,
+            }
+            for c in tagger_error_sentences:
+                for tag_pred, tag_ground, w, wlist in sorted(tagger_error_sentences[c], key=lambda x: (x[0], x[1])):
+                    error_f_tagger.write(c + "\t" + tag_pred + "\t" + tag_ground + "\t" + w + "\t" + " ".join(wlist) + "\n")
+            for c in decoder_error_sentences:
+                for pred, ground, w, sent in sorted(decoder_error_sentences[c], key=lambda x: (x[0], x[1], x[2])):
+                    error_f_decoder.write(c + "\t" + pred + "\t" + ground + "\t" + w + "\t" + sent + "\n")
+
+        # Running Time
+        avg_running_time = np.average(all_run_times) / batch_size  # in ms
+        if verbose:
+            logging.info(f'Average running time (normalized by batch size): {avg_running_time} ms')
+        results['running_time'] = avg_running_time
+
+        # Close log file
+        error_f_tagger.close()
+        error_f_decoder.close()
+        logging.info(f'Errors are saved at {errors_log_fp}.')
+        print(results)
+        return results
+
+
     # Functions for inference
     def _infer(self, sents: List[str], inst_directions: List[str], processed=False):
         """

@@ -81,7 +81,7 @@ def main(cfg: DictConfig) -> None:
         logging.info('Running evaluation of the duplex model (tagger + decoder) on the test set.')
         tn_model = DuplexTextNormalizationModel(tagger_model, decoder_model, lang)
         test_dataset = TextNormalizationTestDataset(cfg.data.test_ds.data_path, cfg.mode, lang)
-        results = tn_model.evaluate(test_dataset, cfg.data.test_ds.batch_size, cfg.data.test_ds.errors_log_fp)
+        results = tn_model.evaluate_with_details(test_dataset, cfg.data.test_ds.batch_size, cfg.data.test_ds.errors_log_fp)
         print(f'\nTest results: {results}')
 
 
