@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import pdb
 from collections import defaultdict
 from typing import List, Tuple
 
@@ -322,8 +322,11 @@ class TextNormalizationTestDataset:
                         tag_ground_truth.append("I-TRANSFORM")
                 begin = end
 
-            assert (len(tag_ground_truth) == len(tag_preds[i])), "tag_ground_truth=" + str(tag_ground_truth) + "; tag_preds[i])=" + str(tag_preds[i])
-            assert (len(classes_for_tag_preds) == len(tag_preds[i])), "classes_for_tag_preds=" + str(classes_for_tag_preds)
+            if len(tag_ground_truth) != len(tag_preds[i]):
+                print("Warning: skip sentence: ", inputs[i])
+                continue
+            assert (len(tag_ground_truth) == len(tag_preds[i])), "tag_ground_truth=" + str(tag_ground_truth) + "; tag_preds[i])=" + str(tag_preds[i]) + "; len(tag_ground_truth)=" + str(len(tag_ground_truth)) + "; len(tag_preds[i])=" + str(len(tag_preds[i]))
+            assert (len(classes_for_tag_preds) == len(tag_preds[i])), "classes_for_tag_preds=" + str(classes_for_tag_preds) + "; len(classes_for_tag_preds)=" + str(len(classes_for_tag_preds)) + "; len(tag_preds[i])=" + str(len(tag_preds[i]))
 
             for j in range(len(tag_preds[i])):
                 sum_tags_per_class[classes_for_tag_preds[j]] += 1
